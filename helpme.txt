@@ -419,3 +419,110 @@ def conv_to_GB(size_in_bytes):
 
 # To run the asynchronous function
 # asyncio.run(get_vm_data(content, url, cluster_children))
+
+
+
+=========================================================================
+Step 3 : 
+import asyncio
+from pyVmomi import vim, vmodl
+from pyVim.connect import SmartConnect, Disconnect
+
+async def get_vm_data(content, url, cluster_children):
+    vm_property_spec = vmodl.query.PropertyCollector.PropertySpec(
+        type=vim.VirtualMachine,
+        pathSet=[
+            "name",
+            "parent",
+            "summary.config.template",
+            "summary.runtime.connectionState",
+            "summary.runtime.host",
+            "summary.config.guestFullName",
+            "config.hardware.memoryMB",
+            "config.hardware.numCpu",
+            "summary.runtime.powerState",
+            "overallStatus",
+            "summary.guest.toolsStatus",
+            "guest.toolsVersion",
+            "guest.toolsRunningStatus",
+            "guest.net",
+            "summary.storage.committed",
+            "snapshot",
+            "snapshot.rootSnapshotList",
+            "summary.config.guestFullName",
+            "storage.perDatastoreUsage"
+        ]
+    )
+
+    traverse_network_system = vmodl.query.PropertyCollector.TraversalSpec(
+        name='traverseNetworkSystem',
+        type=vim.HostSystem,
+        path='configManager.networkSystem',
+        skip=False
+    )
+
+    traverse_datastore_system = vmodl.query.PropertyCollector.TraversalSpec(
+        name='traverseDatastoreSystem',
+        type=vim.HostSystem,
+        path='configManager.datastoreSystem',
+        skip=False
+    )
+
+    traverse_file_system_volume = vmodl.query.PropertyCollector.TraversalSpec(
+        name='traverseFileSystemVolume',
+        type=vim.HostSystem,
+        path='configManager.storageSystem.fileSystemVolumeInfo.mountInfo',
+        skip=False
+    )
+
+    host_to_configManager_traversal_spec = vmodl.query.PropertyCollector.TraversalSpec(
+        name='host_to_configManager',
+        type=vim.HostSystem,
+        path='configManager',
+        skip=False,
+        selectSet=[
+            vmodl.query.PropertyCollector.SelectionSpec(name='traverseNetworkSystem'),
+            vmodl.query.PropertyCollector.SelectionSpec(name='traverseDatastoreSystem'),
+            vmodl.query.PropertyCollector.SelectionSpec(name='traverseFileSystemVolume')
+        ]
+    )
+
+    vm_to_host_traversal_spec = vmodl.query.PropertyCollector.TraversalSpec(
+        name='vm_to_host',
+        type=vim.VirtualMachine,
+        path='runtime.host',
+        skip=False,
+        selectSet=[vmodl.query.PropertyCollector.SelectionSpec(name='host_to_configManager')]
+    )
+
+    vm_container_view = content.viewManager.CreateContainerView(
+        content.rootFolder, [vim.VirtualMachine], True
+    )
+
+    vm_object_spec = vmodl.query.PropertyCollector.ObjectSpec(
+        obj=vm_container_view,
+        skip=False,
+        selectSet=[vm_to_host_traversal_spec, host_to_configManager_traversal_spec]
+    )
+
+    vm_filter_spec = vmodl.query.PropertyCollector.FilterSpec(
+        objectSet=[vm_object_spec],
+        propSet=[vm_property_spec]
+    )
+
+    collector = content.propertyCollector
+    props = collector.RetrieveContents([vm_filter_spec])
+
+    # Process the properties
+    vm_data = []
+    for prop in props:
+        virtual_machine = {p.name: p.val for p in prop.propSet}
+        vm_data.append(virtual_machine)
+
+    return vm_data
+
+# Example connection setup and execution
+# si = SmartConnect(...)
+# content = si.RetrieveContent()
+# data = asyncio.run(get_vm_data(content, url, cluster_children))
+# Disconnect(si)
