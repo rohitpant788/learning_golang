@@ -1,0 +1,421 @@
+Sol 1 : 
+
+import datetime
+from pyVmomi import vim, vmodl
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import ssl
+from pyVim.connect import SmartConnect, Disconnect
+
+async def get_vm_data(content, url, cluster_children):
+    # Define the TraversalSpec to navigate from VirtualMachine to HostSystem
+    vm_to_host_traversal_spec = vmodl.query.PropertyCollector.TraversalSpec(
+        name='vm_to_host',
+        type=vim.VirtualMachine,
+        path='runtime.host',
+        skip=False
+    )
+
+    # Define the TraversalSpec to navigate from HostSystem to its managed objects
+    host_to_managed_objects_traversal_spec = vmodl.query.PropertyCollector.TraversalSpec(
+        name='host_to_managed_objects',
+        type=vim.HostSystem,
+        path='configManager',
+        skip=False,
+        selectSet=[
+            vmodl.query.PropertyCollector.SelectionSpec(name='traverseNetworkSystem'),
+            vmodl.query.PropertyCollector.SelectionSpec(name='traverseDatastoreSystem'),
+            vmodl.query.PropertyCollector.SelectionSpec(name='traverseFileSystemVolume')
+        ]
+    )
+
+    # PropertySpec for VirtualMachine
+    vm_property_spec = vmodl.query.PropertyCollector.PropertySpec(
+        type=vim.VirtualMachine,
+        pathSet=[
+            "name",
+            "summary.config.template",
+            "summary.runtime.connectionState",
+            "summary.runtime.host",
+            "summary.config.guestFullName",
+            "config.hardware.memoryMB",
+            "config.hardware.numCpu",
+            "summary.runtime.powerState",
+            "overallStatus",
+            "summary.guest.toolsStatus",
+            "guest.toolsVersion",
+            "guest.toolsRunningStatus",
+            "guest.net",
+            "summary.storage.committed",
+            "snapshot",
+            "snapshot.rootSnapshotList",
+            "summary.config.guestFullName",
+            "storage.perDatastoreUsage"
+        ]
+    )
+
+    # PropertySpec for HostSystem
+    host_property_spec = vmodl.query.PropertyCollector.PropertySpec(
+        type=vim.HostSystem,
+        pathSet=[
+            "name",
+            "parent.name",
+            "config.product.version",
+            "configManager.networkSystem",
+            "configManager.datastoreSystem",
+            "configManager.fileSystemVolume",
+        ]
+    )
+
+    # ObjectSpec starting from the rootFolder
+    obj_spec = vmodl.query.PropertyCollector.ObjectSpec(
+        obj=content.rootFolder,
+        skip=False,
+        selectSet=[vm_to_host_traversal_spec, host_to_managed_objects_traversal_spec]
+    )
+
+    # Combine PropertySpecs and ObjectSpec into a FilterSpec
+    filter_spec = vmodl.query.PropertyCollector.FilterSpec(
+        objectSet=[obj_spec],
+        propSet=[vm_property_spec, host_property_spec]
+    )
+
+    # Retrieve properties
+    collector = content.propertyCollector
+    options = vmodl.query.PropertyCollector.RetrieveOptions()
+    result = collector.RetrievePropertiesEx([filter_spec], options)
+
+    vm_data = []
+    host_data = {}
+
+    # Create a ThreadPoolExecutor
+    executor = ThreadPoolExecutor()
+
+    # Process the results asynchronously
+    tasks = [process_vm_async(prop, cluster_children, executor) for prop in result.objects if isinstance(prop.obj, vim.VirtualMachine)]
+    vm_data = await asyncio.gather(*tasks)
+
+    # Extract host data
+    for prop in result.objects:
+        if isinstance(prop.obj, vim.HostSystem):
+            host = {p.name: p.val for p in prop.propSet}
+            host_data[prop.obj] = host
+
+    # Update VM Data with Host parent information
+    for vm in vm_data:
+        host_ref = vm.get('summary.runtime.host')
+        if host_ref and host_ref in host_data:
+            host_info = host_data[host_ref]
+            vm['runtime.host.name'] = host_info.get('name')
+            vm['summary.runtime.host.parent'] = host_info.get('parent.name')
+            vm['runtime.host.config.product.version'] = host_info.get('config.product.version')
+
+            vm['cluster'] = host_info.get('parent.name')
+            vm['host'] = host_info.get('name')
+            vm['hostVersion'] = host_info.get('config.product.version')
+
+            overrides = get_overrides_info(vm, cluster_children)
+            vm['overrides'] = overrides
+
+            # Retrieve nested properties from managed objects
+            managed_objects = {}
+            for mo_path in ["configManager.networkSystem", "configManager.datastoreSystem", "configManager.fileSystemVolume"]:
+                mo = host_info.get(mo_path)
+                if mo:
+                    managed_objects[mo_path] = mo
+            vm['managed_objects'] = managed_objects
+
+            # Remove the host_ref as it is not needed
+            del vm['summary.runtime.host']
+
+    # Shutdown the executor
+    executor.shutdown(wait=True)
+
+    return [vm for vm in vm_data if vm]
+
+async def process_vm_async(prop, cluster_children, executor):
+    virtual_machine = {p.name: p.val for p in prop.propSet}
+    vm_data_dict = {}
+    try:
+        if not virtual_machine.get("summary.config.template") and virtual_machine.get("summary.runtime.connectionState") != vim.HostSystem.ConnectionState.notResponding:
+            if virtual_machine.get("config.managedBy") is not None and virtual_machine.get("config.managedBy.type") == "placeHolderVm":
+                log.info(f"Not caching placeholder VM {virtual_machine.get('name')}")
+                return None
+
+            disks = await get_disks_info_async(virtual_machine)
+            networks = get_networks_info(virtual_machine)
+            last_updated_date = datetime.datetime.now(datetime.timezone.utc)
+            lastUpdated = last_updated_date.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            overrides = get_overrides_info(virtual_machine, cluster_children)
+
+            vm_data_dict['name'] = virtual_machine.get('name') if virtual_machine.get('name') is not None else ''
+            vm_data_dict['host_ref'] = virtual_machine.get('summary.runtime.host') if virtual_machine.get('summary.runtime.host') else None
+            vm_data_dict['configVersion'] = virtual_machine.get('config.version') if virtual_machine.get('config.version') is not None else ''
+            vm_data_dict['guestFullName'] = virtual_machine.get('config.guestFullName')
+            vm_data_dict['disks'] = disks
+            vm_data_dict['networks'] = networks
+            vm_data_dict['lastUpdated'] = lastUpdated
+            vm_data_dict['overrides'] = overrides
+            vm_data_dict['uuid'] = virtual_machine.get('config.uuid')
+            vm_data_dict['toolsVersion'] = virtual_machine.get('summary.guest.toolsVersion')
+            vm_data_dict['product'] = virtual_machine.get('config.product.version')
+            vm_data_dict['memory'] = f"{virtual_machine.get('config.hardware.memoryMB')} MB"
+            vm_data_dict['cpu'] = f"{virtual_machine.get('config.hardware.numCpu')} CPUs ({virtual_machine.get('config.hardware.numCoresPerSocket')} Cores/Socket)"
+            vm_data_dict['powerState'] = virtual_machine.get('summary.runtime.powerState')
+            vm_data_dict['overallStatus'] = virtual_machine.get('overallStatus')
+            vm_data_dict['toolsStatus'] = virtual_machine.get('summary.guest.toolsStatus')
+            vm_data_dict['toolsRunningStatus'] = virtual_machine.get('summary.guest.toolsRunningStatus')
+            vm_data_dict['path'] = await asyncio.to_thread(get_vm_path, virtual_machine)
+            vm_data_dict['dataStorageUsageInGB'] = await asyncio.to_thread(calclate_data_storage_usage, virtual_machine)
+            vm_data_dict['storageUsage'] = f"{virtual_machine.get('summary.storage.committed')/(1024*1024*1024)} GB" if virtual_machine.get('summary.storage.committed') is not None else 'N/A'
+
+            return vm_data_dict
+    except AttributeError as e:
+        log.error(f"Error with VM {virtual_machine.get('name')}: {e}")
+    return None
+
+async def get_disks_info_async(vm):
+    log.info(f'total disks for {vm.name} = {len(vm.config.hardware.device)}')
+    disks = [x for x in vm.config.hardware.device if hasattr(x, 'backing')]
+    disks_dict = {}
+    for disk in disks:
+        if disk.backing is not None and isinstance(disk.backing, vim.vm.device.VirtualDevice.FileBackingInfo):
+            disk_info = {
+                'diskId': get_disk(disk.controllerKey, disk.unitNumber),
+                'capacityInGB': conv_to_GB(disk.capacityInBytes),
+                'datastore': disk.backing.datastore.name,
+                'fileName': disk.backing.fileName,
+                'label': disk.deviceInfo.label
+            }
+            disks_dict[disk.deviceInfo.label] = disk_info
+    return disks_dict
+
+async def retrieve_host_properties_async(content, collector, host_refs):
+    host_property_spec = vmodl.query.PropertyCollector.PropertySpec(
+        type=vim.HostSystem,
+        pathSet=["name", "parent.name", "config.product.version"]
+    )
+
+    host_object_specs = [vmodl.query.PropertyCollector.ObjectSpec(obj=host) for host in host_refs]
+
+    host_filter_spec = vmodl.query.PropertyCollector.FilterSpec(
+        objectSet=host_object_specs,
+        propSet=[host_property_spec]
+    )
+
+    host_props = collector.RetrieveContents([host_filter_spec])
+
+    return {host.obj: {p.name: p.val for p in host.propSet} for host in host_props}
+
+def get_networks_info(vm):
+    return []
+
+def get_overrides_info(vm, cluster_children):
+    return {}
+
+def get_vm_path(vm):
+    parent = vm.get('parent')
+    path = ""
+    while isinstance(parent, vim.Folder):
+        path = parent.name + "/" + path
+        parent = parent.parent
+    return path.replace("vm", "")
+
+def get_disk(controller_key, unit_number):
+    return ''
+
+def conv_to_GB(size_in_bytes):
+    return size_in_bytes / (1024 * 1024 * 1024)
+
+# To run the asynchronous function
+# asyncio.run(get_vm_data(content, url, cluster_children))
+
+
+Sol2 : 
+
+import datetime
+from pyVmomi import vim, vmodl
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import ssl
+from pyVim.connect import SmartConnect, Disconnect
+
+async def get_vm_data(content, url, cluster_children):
+    # Define the TraversalSpec to navigate from VirtualMachine to HostSystem
+    vm_to_host_traversal_spec = vmodl.query.PropertyCollector.TraversalSpec(
+        name='vm_to_host',
+        type=vim.VirtualMachine,
+        path='runtime.host',
+        skip=False,
+        selectSet=[
+            vmodl.query.PropertyCollector.SelectionSpec(name='host_to_configManager')
+        ]
+    )
+
+    # Define the TraversalSpec to navigate from HostSystem to its managed objects
+    host_to_configManager_traversal_spec = vmodl.query.PropertyCollector.TraversalSpec(
+        name='host_to_configManager',
+        type=vim.HostSystem,
+        path='configManager',
+        skip=False,
+        selectSet=[
+            vmodl.query.PropertyCollector.SelectionSpec(name='traverseNetworkSystem'),
+            vmodl.query.PropertyCollector.SelectionSpec(name='traverseDatastoreSystem'),
+            vmodl.query.PropertyCollector.SelectionSpec(name='traverseFileSystemVolume')
+        ]
+    )
+
+    # PropertySpec for VirtualMachine including nested HostSystem properties
+    vm_property_spec = vmodl.query.PropertyCollector.PropertySpec(
+        type=vim.VirtualMachine,
+        pathSet=[
+            "name",
+            "summary.config.template",
+            "summary.runtime.connectionState",
+            "summary.runtime.host",  # Host reference
+            "summary.config.guestFullName",
+            "config.hardware.memoryMB",
+            "config.hardware.numCpu",
+            "summary.runtime.powerState",
+            "overallStatus",
+            "summary.guest.toolsStatus",
+            "guest.toolsVersion",
+            "guest.toolsRunningStatus",
+            "guest.net",
+            "summary.storage.committed",
+            "snapshot",
+            "snapshot.rootSnapshotList",
+            "summary.config.guestFullName",
+            "storage.perDatastoreUsage",
+            "runtime.host.name",  # Host properties
+            "runtime.host.parent.name",
+            "runtime.host.config.product.version",
+            "runtime.host.configManager.networkSystem",
+            "runtime.host.configManager.datastoreSystem",
+            "runtime.host.configManager.fileSystemVolume"
+        ]
+    )
+
+    # ObjectSpec starting from the rootFolder
+    obj_spec = vmodl.query.PropertyCollector.ObjectSpec(
+        obj=content.rootFolder,
+        skip=False,
+        selectSet=[vm_to_host_traversal_spec, host_to_configManager_traversal_spec]
+    )
+
+    # Combine PropertySpecs and ObjectSpec into a FilterSpec
+    filter_spec = vmodl.query.PropertyCollector.FilterSpec(
+        objectSet=[obj_spec],
+        propSet=[vm_property_spec]
+    )
+
+    # Retrieve properties
+    collector = content.propertyCollector
+    options = vmodl.query.PropertyCollector.RetrieveOptions()
+    result = collector.RetrievePropertiesEx([filter_spec], options)
+
+    vm_data = []
+
+    # Create a ThreadPoolExecutor
+    executor = ThreadPoolExecutor()
+
+    # Process the results asynchronously
+    tasks = [process_vm_async(prop, cluster_children, executor) for prop in result.objects if isinstance(prop.obj, vim.VirtualMachine)]
+    vm_data = await asyncio.gather(*tasks)
+
+    # Shutdown the executor
+    executor.shutdown(wait=True)
+
+    return [vm for vm in vm_data if vm]
+
+async def process_vm_async(prop, cluster_children, executor):
+    virtual_machine = {p.name: p.val for p in prop.propSet}
+    vm_data_dict = {}
+    try:
+        if not virtual_machine.get("summary.config.template") and virtual_machine.get("summary.runtime.connectionState") != vim.HostSystem.ConnectionState.notResponding:
+            if virtual_machine.get("config.managedBy") is not None and virtual_machine.get("config.managedBy.type") == "placeHolderVm":
+                log.info(f"Not caching placeholder VM {virtual_machine.get('name')}")
+                return None
+
+            disks = await get_disks_info_async(virtual_machine)
+            networks = get_networks_info(virtual_machine)
+            last_updated_date = datetime.datetime.now(datetime.timezone.utc)
+            lastUpdated = last_updated_date.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            overrides = get_overrides_info(virtual_machine, cluster_children)
+
+            vm_data_dict['name'] = virtual_machine.get('name') if virtual_machine.get('name') is not None else ''
+            vm_data_dict['host_ref'] = virtual_machine.get('summary.runtime.host') if virtual_machine.get('summary.runtime.host') else None
+            vm_data_dict['configVersion'] = virtual_machine.get('config.version') if virtual_machine.get('config.version') is not None else ''
+            vm_data_dict['guestFullName'] = virtual_machine.get('config.guestFullName')
+            vm_data_dict['disks'] = disks
+            vm_data_dict['networks'] = networks
+            vm_data_dict['lastUpdated'] = lastUpdated
+            vm_data_dict['overrides'] = overrides
+            vm_data_dict['uuid'] = virtual_machine.get('config.uuid')
+            vm_data_dict['toolsVersion'] = virtual_machine.get('summary.guest.toolsVersion')
+            vm_data_dict['product'] = virtual_machine.get('config.product.version')
+            vm_data_dict['memory'] = f"{virtual_machine.get('config.hardware.memoryMB')} MB"
+            vm_data_dict['cpu'] = f"{virtual_machine.get('config.hardware.numCpu')} CPUs ({virtual_machine.get('config.hardware.numCoresPerSocket')} Cores/Socket)"
+            vm_data_dict['powerState'] = virtual_machine.get('summary.runtime.powerState')
+            vm_data_dict['overallStatus'] = virtual_machine.get('overallStatus')
+            vm_data_dict['toolsStatus'] = virtual_machine.get('summary.guest.toolsStatus')
+            vm_data_dict['toolsRunningStatus'] = virtual_machine.get('summary.guest.toolsRunningStatus')
+            vm_data_dict['path'] = await asyncio.to_thread(get_vm_path, virtual_machine)
+            vm_data_dict['dataStorageUsageInGB'] = await asyncio.to_thread(calclate_data_storage_usage, virtual_machine)
+            vm_data_dict['storageUsage'] = f"{virtual_machine.get('summary.storage.committed')/(1024*1024*1024)} GB" if virtual_machine.get('summary.storage.committed') is not None else 'N/A'
+
+            # Host information
+            vm_data_dict['host'] = {
+                'name': virtual_machine.get('runtime.host.name'),
+                'parent': virtual_machine.get('runtime.host.parent.name'),
+                'version': virtual_machine.get('runtime.host.config.product.version'),
+                'managed_objects': {
+                    'networkSystem': virtual_machine.get('runtime.host.configManager.networkSystem'),
+                    'datastoreSystem': virtual_machine.get('runtime.host.configManager.datastoreSystem'),
+                    'fileSystemVolume': virtual_machine.get('runtime.host.configManager.fileSystemVolume')
+                }
+            }
+
+            return vm_data_dict
+    except AttributeError as e:
+        log.error(f"Error with VM {virtual_machine.get('name')}: {e}")
+    return None
+
+async def get_disks_info_async(vm):
+    log.info(f'total disks for {vm.name} = {len(vm.config.hardware.device)}')
+    disks = [x for x in vm.config.hardware.device if hasattr(x, 'backing')]
+    disks_dict = {}
+    for disk in disks:
+        if disk.backing is not None and isinstance(disk.backing, vim.vm.device.VirtualDevice.FileBackingInfo):
+            disk_info = {
+                'diskId': get_disk(disk.controllerKey, disk.unitNumber),
+                'capacityInGB': conv_to_GB(disk.capacityInBytes),
+                'datastore': disk.backing.datastore.name,
+                'fileName': disk.backing.fileName,
+                'label': disk.deviceInfo.label
+            }
+            disks_dict[disk.deviceInfo.label] = disk_info
+    return disks_dict
+
+def get_networks_info(vm):
+    return []
+
+def get_overrides_info(vm, cluster_children):
+    return {}
+
+def get_vm_path(vm):
+    parent = vm.get('parent')
+    path = ""
+    while isinstance(parent, vim.Folder):
+        path = parent.name + "/" + path
+        parent = parent.parent
+    return path.replace("vm", "")
+
+def get_disk(controller_key, unit_number):
+    return ''
+
+def conv_to_GB(size_in_bytes):
+    return size_in_bytes / (1024 * 1024 * 1024)
+
+# To run the asynchronous function
+# asyncio.run(get_vm_data(content, url, cluster_children))
